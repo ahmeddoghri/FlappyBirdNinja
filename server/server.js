@@ -12,7 +12,7 @@ const io = socketIo(server, {
     }
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3001;
 
 // Serve static files from public directory
 app.use(express.static(path.join(__dirname, '../public')));
@@ -30,12 +30,22 @@ class GameRoom {
         this.gameState = 'waiting';
         this.createdAt = Date.now();
         this.maxPlayers = 4;
+        this.gameStartTime = null;
+        this.fruits = [];
+        this.walls = [];
+        this.gameLoop = null;
+        this.lastFruitSpawn = 0;
+        this.lastWallSpawn = 0;
+        this.gameSpeed = 2;
     }
     
     addPlayer(playerId, socket) {
         if (this.players.size >= this.maxPlayers) {
             return { success: false, message: 'Room is full' };
         }
+        
+        const playerColors = ['#FFD700', '#FF6B6B', '#4ECDC4', '#45B7D1'];
+        const playerIndex = this.players.size;
         
         this.players.set(playerId, {
             id: playerId,
@@ -45,9 +55,16 @@ class GameRoom {
             player: {
                 x: 150,
                 y: 300,
-                velocityY: 0
+                velocityY: 0,
+                width: 40,
+                height: 30,
+                gravity: 0.3, // Reduced from 0.5 to 0.3 for easier control
+                jumpPower: -10, // Increased from -8 to -10 for stronger jumps
+                color: playerColors[playerIndex]
             },
-            isReady: false
+            isReady: false,
+            isAlive: true,
+            lastUpdate: Date.now()
         });
         
         return { success: true };
@@ -59,6 +76,10 @@ class GameRoom {
         // If room is empty, mark for deletion
         if (this.players.size === 0) {
             this.shouldDelete = true;
+            if (this.gameLoop) {
+                clearInterval(this.gameLoop);
+                this.gameLoop = null;
+            }
         }
     }
     
@@ -75,15 +96,416 @@ class GameRoom {
     }
     
     getGameState() {
-        const opponents = {};
+        const players = {};
         this.players.forEach((player, playerId) => {
-            opponents[playerId] = {
+            players[playerId] = {
                 score: player.score,
                 combo: player.combo,
-                player: player.player
+                player: player.player,
+                isAlive: player.isAlive
             };
         });
-        return { opponents };
+        return { 
+            players,
+            fruits: this.fruits,
+            walls: this.walls,
+            gameState: this.gameState,
+            gameSpeed: this.gameSpeed
+        };
+    }
+    
+    startGame() {
+        if (this.gameState === 'playing') return;
+        
+        this.gameState = 'playing';
+        this.gameStartTime = Date.now();
+        this.lastFruitSpawn = Date.now();
+        this.lastWallSpawn = Date.now();
+        this.fruits = [];
+        this.walls = [];
+        
+        // Reset all players
+        this.players.forEach((player) => {
+            player.player.y = 300;
+            player.player.velocityY = 0;
+            player.isAlive = true;
+            player.score = 0;
+            player.combo = 0;
+        });
+        
+        // Start synchronized game loop
+        this.gameLoop = setInterval(() => {
+            this.updateGame();
+        }, 1000/60); // 60 FPS
+        
+        this.broadcastToRoom('gameStarted', this.getGameState());
+    }
+    
+    updateGame() {
+        if (this.gameState !== 'playing') return;
+        
+        // Spawn fruits at synchronized intervals
+        const now = Date.now();
+        if (now - this.lastFruitSpawn > 1000 / this.gameSpeed) {
+            this.spawnFruit();
+            this.lastFruitSpawn = now;
+        }
+        
+        // Spawn walls at synchronized intervals
+        if (now - this.lastWallSpawn > 4000) { // Every 4 seconds for better spacing
+            this.spawnWall();
+            this.lastWallSpawn = now;
+        }
+        
+        // Update fruits
+        this.fruits = this.fruits.filter(fruit => {
+            // Store old position for collision detection
+            const oldX = fruit.x;
+            const oldY = fruit.y;
+            
+            // Update position
+            fruit.x += fruit.velocityX;
+            fruit.y += fruit.velocityY;
+            fruit.rotation += fruit.rotationSpeed || 0.1;
+            
+            // Add fruit physics interactions with players
+            this.players.forEach((player, playerId) => {
+                if (!player.isAlive) return;
+                
+                // Check if fruit bounces off player (but doesn't kill them)
+                if (this.checkCircleRectCollision(fruit, player.player)) {
+                    // Calculate deflection angle
+                    const dx = fruit.x - (player.player.x + player.player.width/2);
+                    const dy = fruit.y - (player.player.y + player.player.height/2);
+                    const distance = Math.sqrt(dx*dx + dy*dy);
+                    
+                    if (distance > 0) {
+                        // Normalize and apply deflection
+                        const normalX = dx / distance;
+                        const normalY = dy / distance;
+                        
+                        // Deflect fruit away from player
+                        fruit.velocityX = normalX * 4 + fruit.velocityX * 0.3;
+                        fruit.velocityY = normalY * 4 + fruit.velocityY * 0.3;
+                        
+                        // Slightly deflect player trajectory
+                        player.player.velocityY += normalY * 0.5;
+                        
+                        this.broadcastToRoom('fruitPlayerBounce', {
+                            fruitId: fruit.id,
+                            playerId: playerId,
+                            x: fruit.x,
+                            y: fruit.y
+                        });
+                    }
+                }
+            });
+            
+            // Apply gravity to fruits
+            fruit.velocityY += 0.2;
+            
+            // Check collision with walls - enhanced physics
+            this.walls.forEach(wall => {
+                if (this.checkFruitWallCollision(fruit, wall)) {
+                    const collisionAngle = this.calculateCollisionAngle(fruit, wall, oldX, oldY);
+                    
+                    // Calculate reflection based on collision angle
+                    const speed = Math.sqrt(fruit.velocityX * fruit.velocityX + fruit.velocityY * fruit.velocityY);
+                    
+                    if (Math.abs(collisionAngle) < Math.PI/4 || Math.abs(collisionAngle) > 3*Math.PI/4) {
+                        // Horizontal collision - reflect X velocity with angle variation
+                        fruit.velocityX = -fruit.velocityX * 0.8;
+                        fruit.velocityY += (Math.random() - 0.5) * 2; // Add some randomness
+                        fruit.x = oldX;
+                    } else {
+                        // Vertical collision - reflect Y velocity with angle variation
+                        fruit.velocityY = -fruit.velocityY * 0.8;
+                        fruit.velocityX += (Math.random() - 0.5) * 1;
+                        fruit.y = oldY;
+                    }
+                    
+                    // Add rotational spin based on impact
+                    fruit.rotationSpeed = (Math.random() - 0.5) * 0.4;
+                    
+                    // Add bounce effect
+                    this.broadcastToRoom('fruitBounce', {
+                        fruitId: fruit.id,
+                        x: fruit.x,
+                        y: fruit.y,
+                        angle: collisionAngle,
+                        wallType: wall.type
+                    });
+                }
+            });
+            
+            // Bounce off screen boundaries
+            if (fruit.y - fruit.radius < 0) {
+                fruit.y = fruit.radius;
+                fruit.velocityY = Math.abs(fruit.velocityY) * 0.8;
+            }
+            if (fruit.y + fruit.radius > 600) {
+                fruit.y = 600 - fruit.radius;
+                fruit.velocityY = -Math.abs(fruit.velocityY) * 0.8;
+            }
+            
+            // Remove fruits that are off screen or sliced
+            return fruit.x > -fruit.radius * 2 && !fruit.sliced;
+        });
+        
+        // Update walls
+        this.walls = this.walls.filter(wall => {
+            wall.x += wall.velocityX;
+            
+            // Remove walls that are off screen
+            return wall.x > -wall.width;
+        });
+        
+        // Check collisions for all alive players
+        this.players.forEach((player, playerId) => {
+            if (!player.isAlive) return;
+            
+            // Check fruit collisions (death)
+            this.fruits.forEach(fruit => {
+                if (!fruit.sliced && this.checkCircleCollision(player.player, fruit)) {
+                    player.isAlive = false;
+                    player.combo = 0;
+                    this.broadcastToRoom('playerDied', {
+                        playerId: playerId,
+                        cause: 'fruit',
+                        x: player.player.x,
+                        y: player.player.y
+                    });
+                }
+            });
+            
+            // Check wall collisions (death)
+            this.walls.forEach(wall => {
+                if (this.checkWallCollision(player.player, wall)) {
+                    player.isAlive = false;
+                    player.combo = 0;
+                    this.broadcastToRoom('playerDied', {
+                        playerId: playerId,
+                        cause: 'wall',
+                        x: player.player.x,
+                        y: player.player.y
+                    });
+                }
+            });
+        });
+        
+        // Broadcast game state updates
+        this.broadcastToRoom('gameUpdate', {
+            fruits: this.fruits,
+            walls: this.walls,
+            timestamp: now
+        });
+    }
+    
+    spawnFruit() {
+        const types = ['apple', 'orange', 'banana', 'bonus'];
+        const weights = [40, 30, 20, 10]; // Probability weights
+        const type = this.weightedRandom(types, weights);
+        
+        const fruit = {
+            id: `fruit_${Date.now()}_${Math.random()}`,
+            x: 850, // Start off-screen
+            y: Math.random() * 400 + 100,
+            radius: type === 'bonus' ? 25 : 20,
+            velocityX: -this.gameSpeed,
+            velocityY: (Math.random() - 0.5) * 2,
+            color: this.getFruitColor(type),
+            type: type,
+            sliced: false,
+            rotation: 0,
+            spawnTime: Date.now()
+        };
+        
+        this.fruits.push(fruit);
+    }
+    
+    getFruitColor(type) {
+        const colors = {
+            apple: '#FF4444',
+            orange: '#FF8844',
+            banana: '#FFDD44',
+            bonus: '#FF44FF'
+        };
+        return colors[type] || '#44FF44';
+    }
+    
+    weightedRandom(items, weights) {
+        const totalWeight = weights.reduce((sum, weight) => sum + weight, 0);
+        let random = Math.random() * totalWeight;
+        
+        for (let i = 0; i < items.length; i++) {
+            random -= weights[i];
+            if (random <= 0) {
+                return items[i];
+            }
+        }
+        
+        return items[0];
+    }
+    
+    sliceFruit(fruitId, playerId) {
+        const fruit = this.fruits.find(f => f.id === fruitId && !f.sliced);
+        if (!fruit) return null;
+        
+        const player = this.players.get(playerId);
+        if (!player || !player.isAlive) return null;
+        
+        fruit.sliced = true;
+        fruit.slicedBy = playerId;
+        
+        // Calculate score
+        let points = fruit.type === 'bonus' ? 50 : 10;
+        if (player.combo > 0) {
+            points += player.combo * 2;
+        }
+        
+        player.score += points;
+        player.combo++;
+        
+        // Special effects
+        if (fruit.type === 'bonus') {
+            this.gameSpeed = Math.min(this.gameSpeed + 0.1, 4);
+        }
+        
+        return {
+            points,
+            newScore: player.score,
+            newCombo: player.combo,
+            fruit: fruit
+        };
+    }
+    
+    spawnWall() {
+        const gapSize = 220; // Much larger gap for easier gameplay
+        const wallWidth = 40; // Thinner walls for better navigation
+        const canvasHeight = 600;
+        const gapY = Math.random() * (canvasHeight - gapSize - 120) + 60;
+        
+        // Choose random wall type for variety
+        const wallTypes = ['crystal', 'tech', 'nature', 'neon'];
+        const wallType = wallTypes[Math.floor(Math.random() * wallTypes.length)];
+        
+        const wall = {
+            id: `wall_${Date.now()}_${Math.random()}`,
+            x: 850,
+            width: wallWidth,
+            topHeight: gapY,
+            bottomY: gapY + gapSize,
+            bottomHeight: canvasHeight - (gapY + gapSize),
+            velocityX: -this.gameSpeed,
+            spawnTime: Date.now(),
+            type: wallType
+        };
+        
+        this.walls.push(wall);
+    }
+    
+    checkCircleCollision(rect, circle) {
+        // Check collision between rectangle (bird) and circle (fruit) - for death
+        const distX = Math.abs(circle.x - rect.x - rect.width/2);
+        const distY = Math.abs(circle.y - rect.y - rect.height/2);
+        
+        if (distX > (rect.width/2 + circle.radius)) return false;
+        if (distY > (rect.height/2 + circle.radius)) return false;
+        
+        if (distX <= (rect.width/2)) return true;
+        if (distY <= (rect.height/2)) return true;
+        
+        const dx = distX - rect.width/2;
+        const dy = distY - rect.height/2;
+        return (dx*dx + dy*dy <= (circle.radius*circle.radius));
+    }
+    
+    checkCircleRectCollision(circle, rect) {
+        // Check collision between circle (fruit) and rectangle (player) - for bouncing
+        const distX = Math.abs(circle.x - rect.x - rect.width/2);
+        const distY = Math.abs(circle.y - rect.y - rect.height/2);
+        
+        // Slightly larger collision radius for bouncing effect
+        const bounceRadius = circle.radius + 10;
+        
+        if (distX > (rect.width/2 + bounceRadius)) return false;
+        if (distY > (rect.height/2 + bounceRadius)) return false;
+        
+        if (distX <= (rect.width/2)) return true;
+        if (distY <= (rect.height/2)) return true;
+        
+        const dx = distX - rect.width/2;
+        const dy = distY - rect.height/2;
+        return (dx*dx + dy*dy <= (bounceRadius*bounceRadius));
+    }
+    
+    calculateCollisionAngle(fruit, wall, oldX, oldY) {
+        // Calculate the angle of collision for realistic bouncing
+        const fruitCenterX = fruit.x;
+        const fruitCenterY = fruit.y;
+        const wallCenterX = wall.x + wall.width/2;
+        
+        // Determine which part of the wall was hit
+        if (fruitCenterY < wall.topHeight) {
+            // Hit top wall
+            return Math.atan2(fruitCenterY - wall.topHeight, fruitCenterX - wallCenterX);
+        } else if (fruitCenterY > wall.bottomY) {
+            // Hit bottom wall
+            return Math.atan2(fruitCenterY - wall.bottomY, fruitCenterX - wallCenterX);
+        } else {
+            // Hit side of wall
+            return Math.atan2(fruitCenterY - (wall.topHeight + wall.bottomY)/2, fruitCenterX - wallCenterX);
+        }
+    }
+    
+    checkWallCollision(bird, wall) {
+        // Check if bird hits top or bottom wall
+        const birdLeft = bird.x;
+        const birdRight = bird.x + bird.width;
+        const birdTop = bird.y;
+        const birdBottom = bird.y + bird.height;
+        
+        const wallLeft = wall.x;
+        const wallRight = wall.x + wall.width;
+        
+        // Check if bird is within wall's x range
+        if (birdRight > wallLeft && birdLeft < wallRight) {
+            // Check collision with top wall
+            if (birdTop < wall.topHeight) {
+                return true;
+            }
+            // Check collision with bottom wall
+            if (birdBottom > wall.bottomY) {
+                return true;
+            }
+        }
+        
+        return false;
+    }
+    
+    checkFruitWallCollision(fruit, wall) {
+        // Check if fruit collides with wall (top or bottom part)
+        const fruitLeft = fruit.x - fruit.radius;
+        const fruitRight = fruit.x + fruit.radius;
+        const fruitTop = fruit.y - fruit.radius;
+        const fruitBottom = fruit.y + fruit.radius;
+        
+        const wallLeft = wall.x;
+        const wallRight = wall.x + wall.width;
+        
+        // Check if fruit is within wall's x range
+        if (fruitRight > wallLeft && fruitLeft < wallRight) {
+            // Check collision with top wall part
+            if (fruitTop < wall.topHeight) {
+                return true;
+            }
+            // Check collision with bottom wall part
+            if (fruitBottom > wall.bottomY) {
+                return true;
+            }
+        }
+        
+        return false;
     }
 }
 
@@ -164,6 +586,11 @@ io.on('connection', (socket) => {
             // Send current game state to new player
             socket.emit('gameState', room.getGameState());
             
+            // If game is in progress, sync the new player
+            if (room.gameState === 'playing') {
+                socket.emit('gameStarted', room.getGameState());
+            }
+            
             console.log(`Player ${socket.id} joined room ${room.roomName}`);
         } catch (error) {
             console.error('Error joining room:', error);
@@ -199,7 +626,7 @@ io.on('connection', (socket) => {
         }
     });
     
-    socket.on('playerUpdate', ({ roomId, score, combo, player }) => {
+    socket.on('playerUpdate', ({ roomId, player }) => {
         try {
             const room = rooms.get(roomId);
             if (!room) return;
@@ -207,21 +634,123 @@ io.on('connection', (socket) => {
             const playerData = room.players.get(socket.id);
             if (!playerData) return;
             
-            // Update player data
-            playerData.score = score;
-            playerData.combo = combo;
-            playerData.player = player;
+            // Update player position and physics
+            playerData.player.y = player.y;
+            playerData.player.velocityY = player.velocityY;
+            playerData.lastUpdate = Date.now();
+            
+            // Check for collision with ground
+            if (player.y + player.height >= 600) {
+                playerData.isAlive = false;
+                playerData.combo = 0;
+            }
             
             // Broadcast to other players in the room
-            room.broadcastToRoom('opponentUpdate', {
+            room.broadcastToRoom('playerMoved', {
                 playerId: socket.id,
-                score: score,
-                combo: combo,
-                player: player
+                player: playerData.player,
+                isAlive: playerData.isAlive,
+                score: playerData.score,
+                combo: playerData.combo
             }, socket.id);
             
         } catch (error) {
             console.error('Error updating player:', error);
+        }
+    });
+    
+    socket.on('playerJump', ({ roomId }) => {
+        try {
+            const room = rooms.get(roomId);
+            if (!room) return;
+            
+            const playerData = room.players.get(socket.id);
+            if (!playerData || !playerData.isAlive) return;
+            
+            // Apply jump
+            playerData.player.velocityY = playerData.player.jumpPower;
+            
+            // Broadcast jump to other players
+            room.broadcastToRoom('playerJumped', {
+                playerId: socket.id,
+                player: playerData.player
+            }, socket.id);
+            
+        } catch (error) {
+            console.error('Error handling jump:', error);
+        }
+    });
+    
+    socket.on('sliceFruit', ({ roomId, fruitId, sliceData }) => {
+        try {
+            const room = rooms.get(roomId);
+            if (!room) return;
+            
+            const result = room.sliceFruit(fruitId, socket.id);
+            if (!result) return;
+            
+            // Broadcast slice to all players including the one who sliced
+            room.broadcastToRoom('fruitSliced', {
+                playerId: socket.id,
+                fruitId: fruitId,
+                points: result.points,
+                newScore: result.newScore,
+                newCombo: result.newCombo,
+                sliceData: sliceData
+            });
+            
+            // Also send to the player who made the slice
+            socket.emit('fruitSliced', {
+                playerId: socket.id,
+                fruitId: fruitId,
+                points: result.points,
+                newScore: result.newScore,
+                newCombo: result.newCombo,
+                sliceData: sliceData
+            });
+            
+        } catch (error) {
+            console.error('Error handling fruit slice:', error);
+        }
+    });
+    
+    socket.on('startGame', ({ roomId }) => {
+        try {
+            const room = rooms.get(roomId);
+            if (!room) return;
+            
+            // Only room creator can start the game
+            const playerData = room.players.get(socket.id);
+            if (!playerData) return;
+            
+            room.startGame();
+            
+        } catch (error) {
+            console.error('Error starting game:', error);
+        }
+    });
+    
+    socket.on('playerReady', ({ roomId, isReady }) => {
+        try {
+            const room = rooms.get(roomId);
+            if (!room) return;
+            
+            const playerData = room.players.get(socket.id);
+            if (!playerData) return;
+            
+            playerData.isReady = isReady;
+            
+            // Check if all players are ready
+            const allReady = Array.from(room.players.values()).every(p => p.isReady);
+            
+            room.broadcastToRoom('playerReadyUpdate', {
+                playerId: socket.id,
+                isReady: isReady,
+                allReady: allReady && room.players.size > 1
+            });
+            
+        } catch (error) {
+            console.error('Error updating ready state:', error);
         }
     });
     
@@ -258,7 +787,7 @@ io.on('connection', (socket) => {
 
 // Utility functions
 function generateRoomId() {
-    return Math.random().toString(36).substr(2, 9);
+    return Math.random().toString(36).substring(2, 11);
 }
 
 function getBaseUrl() {
