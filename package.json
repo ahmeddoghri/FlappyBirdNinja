@@ -1,0 +1,21 @@
+{
+  "name": "flappy-bird-ninja",
+  "version": "1.0.0",
+  "description": "A creative Flappy Bird game with Fruit Ninja elements and multiplayer support",
+  "main": "server/server.js",
+  "scripts": {
+    "start": "node server/server.js",
+    "dev": "nodemon server/server.js",
+    "test": "echo \"Testing game mechanics...\" && node test/test.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "socket.io": "^4.7.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "keywords": ["game", "flappy-bird", "fruit-ninja", "multiplayer", "html5"],
+  "author": "FlappyBirdNinja",
+  "license": "MIT"
+}
