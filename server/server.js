@@ -14,6 +14,17 @@ const io = socketIo(server, {
 
 const PORT = process.env.PORT || 3001;
 
+// Shared game configuration to unify single and multiplayer feel
+const GAME_CONFIG = {
+    gravity: 0.3,
+    jumpPower: -10,
+    fruitGravity: 0.2,
+    wallGapSize: 220,
+    wallWidth: 40,
+    wallSpawnIntervalMs: 4000,
+    baseGameSpeed: 2,
+};
+
 // Serve static files from public directory
 app.use(express.static(path.join(__dirname, '../public')));
 
@@ -36,7 +47,7 @@ class GameRoom {
         this.gameLoop = null;
         this.lastFruitSpawn = 0;
         this.lastWallSpawn = 0;
-        this.gameSpeed = 2;
+        this.gameSpeed = GAME_CONFIG.baseGameSpeed;
     }
     
     addPlayer(playerId, socket) {
@@ -58,13 +69,21 @@ class GameRoom {
                 velocityY: 0,
                 width: 40,
                 height: 30,
-                gravity: 0.3, // Reduced from 0.5 to 0.3 for easier control
-                jumpPower: -10, // Increased from -8 to -10 for stronger jumps
-                color: playerColors[playerIndex]
+                gravity: GAME_CONFIG.gravity,
+                jumpPower: GAME_CONFIG.jumpPower,
+                color: playerColors[playerIndex],
+                character: 'ninja', // Default cute character
+                customization: {
+                    character: 'ninja',
+                    color: playerColors[playerIndex],
+                    accessory: 'none',
+                    trail: 'sparkle'
+                }
             },
             isReady: false,
             isAlive: true,
-            lastUpdate: Date.now()
+            lastUpdate: Date.now(),
+            sabotageEffects: new Map() // For tracking active sabotage effects
         });
         
         return { success: true };
@@ -110,7 +129,8 @@ class GameRoom {
             fruits: this.fruits,
             walls: this.walls,
             gameState: this.gameState,
-            gameSpeed: this.gameSpeed
+            gameSpeed: this.gameSpeed,
+            gameConfig: GAME_CONFIG
         };
     }
     
@@ -152,7 +172,7 @@ class GameRoom {
         }
         
         // Spawn walls at synchronized intervals
-        if (now - this.lastWallSpawn > 4000) { // Every 4 seconds for better spacing
+        if (now - this.lastWallSpawn > GAME_CONFIG.wallSpawnIntervalMs) { // Configurable spacing
             this.spawnWall();
             this.lastWallSpawn = now;
         }
@@ -202,7 +222,7 @@ class GameRoom {
             });
             
             // Apply gravity to fruits
-            fruit.velocityY += 0.2;
+            fruit.velocityY += GAME_CONFIG.fruitGravity;
             
             // Check collision with walls - enhanced physics
             this.walls.forEach(wall => {
@@ -302,25 +322,41 @@ class GameRoom {
     }
     
     spawnFruit() {
-        const types = ['apple', 'orange', 'banana', 'bonus'];
-        const weights = [40, 30, 20, 10]; // Probability weights
+        const types = ['apple', 'orange', 'banana', 'bonus', 'destroyer', 'rainbow', 'chaos'];
+        const weights = [35, 25, 20, 10, 5, 3, 2]; // Probability weights
         const type = this.weightedRandom(types, weights);
         
         const fruit = {
             id: `fruit_${Date.now()}_${Math.random()}`,
             x: 850, // Start off-screen
             y: Math.random() * 400 + 100,
-            radius: type === 'bonus' ? 25 : 20,
-            velocityX: -this.gameSpeed,
+            radius: this.getFruitRadius(type),
+            velocityX: -this.gameSpeed * (type === 'chaos' ? 1.5 : 1),
             velocityY: (Math.random() - 0.5) * 2,
             color: this.getFruitColor(type),
             type: type,
             sliced: false,
             rotation: 0,
-            spawnTime: Date.now()
+            spawnTime: Date.now(),
+            special: ['destroyer', 'rainbow', 'chaos'].includes(type),
+            pulsePhase: Math.random() * Math.PI * 2, // For visual effects
+            trailParticles: []
         };
         
         this.fruits.push(fruit);
+    }
+    
+    getFruitRadius(type) {
+        const radii = {
+            apple: 20,
+            orange: 20,
+            banana: 22,
+            bonus: 25,
+            destroyer: 30,
+            rainbow: 28,
+            chaos: 24
+        };
+        return radii[type] || 20;
     }
     
     getFruitColor(type) {
@@ -328,7 +364,10 @@ class GameRoom {
             apple: '#FF4444',
             orange: '#FF8844',
             banana: '#FFDD44',
-            bonus: '#FF44FF'
+            bonus: '#FF44FF',
+            destroyer: '#FF0000',
+            rainbow: '#FF0080',
+            chaos: '#8000FF'
         };
         return colors[type] || '#44FF44';
     }
@@ -357,8 +396,8 @@ class GameRoom {
         fruit.sliced = true;
         fruit.slicedBy = playerId;
         
-        // Calculate score
-        let points = fruit.type === 'bonus' ? 50 : 10;
+        // Calculate base score
+        let points = this.getBaseFruitPoints(fruit.type);
         if (player.combo > 0) {
             points += player.combo * 2;
         }
@@ -366,22 +405,112 @@ class GameRoom {
         player.score += points;
         player.combo++;
         
-        // Special effects
-        if (fruit.type === 'bonus') {
-            this.gameSpeed = Math.min(this.gameSpeed + 0.1, 4);
-        }
+        // Special fruit effects
+        const specialEffect = this.handleSpecialFruitEffects(fruit, playerId);
         
         return {
             points,
             newScore: player.score,
             newCombo: player.combo,
-            fruit: fruit
+            fruit: fruit,
+            specialEffect: specialEffect
         };
     }
     
+    getBaseFruitPoints(type) {
+        const pointValues = {
+            apple: 10,
+            orange: 10,
+            banana: 15,
+            bonus: 50,
+            destroyer: 100,
+            rainbow: 75,
+            chaos: 25
+        };
+        return pointValues[type] || 10;
+    }
+    
+    handleSpecialFruitEffects(fruit, playerId) {
+        const effects = [];
+        
+        switch (fruit.type) {
+            case 'bonus':
+                this.gameSpeed = Math.min(this.gameSpeed + 0.1, 4);
+                effects.push({ type: 'speedBoost', value: this.gameSpeed });
+                break;
+                
+            case 'destroyer':
+                // Destroy all nearby fruits without shade effect
+                const nearbyFruits = this.fruits.filter(f => 
+                    !f.sliced && 
+                    f.id !== fruit.id && 
+                    this.getDistance(f, fruit) < 150
+                );
+                
+                nearbyFruits.forEach(f => {
+                    f.sliced = true;
+                    f.destroyedBy = 'destroyer';
+                    const destroyerPlayer = this.players.get(playerId);
+                    if (destroyerPlayer) {
+                        destroyerPlayer.score += 5; // Bonus points for chain destruction
+                    }
+                });
+                
+                effects.push({ 
+                    type: 'chainDestruction', 
+                    destroyedFruits: nearbyFruits.map(f => f.id),
+                    count: nearbyFruits.length
+                });
+                break;
+                
+            case 'rainbow':
+                // Change background colors for all players
+                const colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7', '#DDA0DD', '#98D8C8'];
+                const randomColor = colors[Math.floor(Math.random() * colors.length)];
+                
+                effects.push({ 
+                    type: 'backgroundChange', 
+                    color: randomColor,
+                    duration: 5000 // 5 seconds
+                });
+                break;
+                
+            case 'chaos':
+                // Sabotage ability - scramble other players' controls briefly
+                const otherPlayers = Array.from(this.players.keys()).filter(id => id !== playerId);
+                
+                effects.push({ 
+                    type: 'controlScramble', 
+                    targetPlayers: otherPlayers,
+                    duration: 2000 // 2 seconds
+                });
+                break;
+        }
+        
+        // Broadcast special effects to all players
+        if (effects.length > 0) {
+            this.broadcastToRoom('specialFruitEffect', {
+                fruitId: fruit.id,
+                fruitType: fruit.type,
+                playerId: playerId,
+                effects: effects,
+                x: fruit.x,
+                y: fruit.y
+            });
+        }
+        
+        return effects;
+    }
+    
+    getDistance(obj1, obj2) {
+        const dx = obj1.x - obj2.x;
+        const dy = obj1.y - obj2.y;
+        return Math.sqrt(dx * dx + dy * dy);
+    }
+    
     spawnWall() {
-        const gapSize = 220; // Much larger gap for easier gameplay
-        const wallWidth = 40; // Thinner walls for better navigation
+        const gapSize = GAME_CONFIG.wallGapSize; // Much larger gap for easier gameplay
+        const wallWidth = GAME_CONFIG.wallWidth; // Thinner walls for better navigation
         const canvasHeight = 600;
         const gapY = Math.random() * (canvasHeight - gapSize - 120) + 60;
         
@@ -751,6 +880,34 @@ io.on('connection', (socket) => {
             
         } catch (error) {
             console.error('Error updating ready state:', error);
+        }
+    });
+    
+    socket.on('updateCustomization', ({ roomId, customization }) => {
+        try {
+            const room = rooms.get(roomId);
+            if (!room) return;
+            
+            const playerData = room.players.get(socket.id);
+            if (!playerData) return;
+            
+            // Update player customization
+            if (customization.character) playerData.player.customization.character = customization.character;
+            if (customization.color) playerData.player.customization.color = customization.color;
+            if (customization.accessory) playerData.player.customization.accessory = customization.accessory;
+            if (customization.trail) playerData.player.customization.trail = customization.trail;
+            
+            // Update main color for compatibility
+            if (customization.color) playerData.player.color = customization.color;
+            
+            // Broadcast customization update to all players
+            room.broadcastToRoom('playerCustomizationUpdate', {
+                playerId: socket.id,
+                customization: playerData.player.customization
+            });
+            
+        } catch (error) {
+            console.error('Error updating customization:', error);
         }
     });
     

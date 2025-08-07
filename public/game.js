@@ -66,6 +66,7 @@ class FlappySlice {
         this.lastWallSpawn = 0;
         this.baseGameSpeed = 2;
         this.gameSpeed = this.baseGameSpeed;
+        this.sharedConfig = null; // Will be populated from server in multiplayer
         this.isReady = false;
         this.lastPlayerUpdate = 0;
         
@@ -127,6 +128,10 @@ class FlappySlice {
             this.mouse.y = e.clientY - rect.top;
             this.mouse.down = true;
             this.mouse.trail = [{x: this.mouse.x, y: this.mouse.y}];
+            // Tap-to-flap on mobile/desktop click
+            if (this.gameState === 'playing') {
+                this.jump();
+            }
         });
         
         this.canvas.addEventListener('mousemove', (e) => {
@@ -157,6 +162,9 @@ class FlappySlice {
             this.mouse.y = touch.clientY - rect.top;
             this.mouse.down = true;
             this.mouse.trail = [{x: this.mouse.x, y: this.mouse.y}];
+            if (this.gameState === 'playing') {
+                this.jump();
+            }
         });
         
         this.canvas.addEventListener('touchmove', (e) => {
@@ -216,6 +224,9 @@ class FlappySlice {
             if (data.walls) {
                 this.walls = data.walls;
             }
+            if (data.gameConfig) {
+                this.applySharedConfig(data.gameConfig);
+            }
         });
         
         this.socket.on('gameStarted', (data) => {
@@ -224,6 +235,9 @@ class FlappySlice {
             this.fruits = data.fruits || [];
             this.walls = data.walls || [];
             this.gameSpeed = data.gameSpeed || 2;
+            if (data.gameConfig) {
+                this.applySharedConfig(data.gameConfig);
+            }
             this.resetGame();
         });
         
@@ -335,7 +349,12 @@ class FlappySlice {
     
     jump() {
         if (this.gameState === 'playing') {
-            this.player.velocityY = this.player.jumpPower;
+            // Add brief coyote-time / jump lock to reduce accidental double inputs
+            const now = performance.now();
+            if (!this.lastJumpAt || now - this.lastJumpAt > 140) {
+                this.player.velocityY = this.player.jumpPower;
+                this.lastJumpAt = now;
+            }
             this.createParticles(this.player.x, this.player.y + this.player.height, '#87CEEB', 5);
             
             // Audio and haptic feedback
@@ -519,9 +538,10 @@ class FlappySlice {
     
     spawnWall() {
         const now = Date.now();
-        if (now - this.lastWallSpawn > 4000) { // Every 4 seconds
-            const gapSize = 220; // Much larger gap for easier gameplay
-            const wallWidth = 40; // Thinner walls
+        const interval = this.wallSpawnInterval || 4000; // unified with server when available
+        if (now - this.lastWallSpawn > interval) {
+            const gapSize = this.configuredWallGap || 220; // unified with server when available
+            const wallWidth = this.configuredWallWidth || 40; // unified with server when available
             const canvasHeight = this.canvas.height;
             const gapY = Math.random() * (canvasHeight - gapSize - 120) + 60;
             
@@ -606,9 +626,9 @@ class FlappySlice {
     update() {
         if (this.gameState !== 'playing') return;
         
-        // Update player physics
+        // Update player physics with slight smoothing
         this.player.velocityY += this.player.gravity;
-        this.player.velocityY *= 0.98; // Add slight air resistance for smoother control
+        this.player.velocityY *= 0.985; // tiny bit more damping for smoother feel
         this.player.y += this.player.velocityY;
         
         // Boundary checks
@@ -809,6 +829,19 @@ class FlappySlice {
         this.updateUI();
     }
     
+    applySharedConfig(cfg) {
+        this.sharedConfig = cfg;
+        // Apply to local player physics and spawns to match multiplayer
+        this.player.gravity = cfg.gravity;
+        // Keep character-modified jumpPower scaling but base from config
+        const currentJumpScale = Math.abs(this.player.jumpPower) / 10; // base -10
+        this.player.jumpPower = -Math.abs(cfg.jumpPower) * (isFinite(currentJumpScale) && currentJumpScale > 0 ? currentJumpScale : 1);
+        this.baseGameSpeed = cfg.baseGameSpeed;
+        // Single-player spawn pacing uses these in spawnWall/spawnFruit through gameSpeed/intervals
+        this.wallSpawnInterval = cfg.wallSpawnIntervalMs;
+        this.configuredWallGap = cfg.wallGapSize;
+        this.configuredWallWidth = cfg.wallWidth;
+    }
     render() {
         // Apply screen shake and zoom effects
         this.ctx.save();
@@ -816,6 +849,7 @@ class FlappySlice {
             this.canvas.width/2 + this.screenShake.x,
             this.canvas.height/2 + this.screenShake.y
         );
+        // Ease camera zoom transitions a bit more for smoothness
         this.ctx.scale(this.cameraZoom, this.cameraZoom);
         this.ctx.translate(-this.canvas.width/2, -this.canvas.height/2);
         
@@ -907,7 +941,8 @@ class FlappySlice {
     drawPlayer(player, color) {
         this.ctx.save();
         this.ctx.translate(player.x + player.width/2, player.y + player.height/2);
-        this.ctx.rotate(player.velocityY * 0.1);
+        // Reduce rotation sensitivity for calmer visuals
+        this.ctx.rotate(player.velocityY * 0.08);
         
         // Draw bird body
         this.ctx.fillStyle = color;
@@ -927,10 +962,17 @@ class FlappySlice {
     drawFruit(fruit) {
         this.ctx.save();
         this.ctx.translate(fruit.x, fruit.y);
-        this.ctx.rotate(fruit.rotation);
+        this.ctx.rotate(fruit.rotation || 0);
         
-        if (fruit.sliced) {
-            this.ctx.globalAlpha = 0.3;
+        if (fruit.sliced && !fruit.destroyedBy) {
+            // Regular sliced fruit - no shade effect as requested
+            this.createParticleExplosion(fruit.x, fruit.y, fruit.color, 15);
+            return; // Don't draw sliced fruit
+        }
+        
+        // Special fruit effects
+        if (fruit.special) {
+            this.drawSpecialFruitEffects(fruit);
         }
         
         // Draw fruit
@@ -939,6 +981,44 @@ class FlappySlice {
         this.ctx.arc(0, 0, fruit.radius, 0, Math.PI * 2);
         this.ctx.fill();
         
+        // Enhanced visuals for special fruits
+        if (fruit.type === 'destroyer') {
+            // Pulsing red glow
+            const pulse = Math.sin(Date.now() * 0.01) * 0.3 + 0.7;
+            this.ctx.shadowBlur = 20;
+            this.ctx.shadowColor = '#FF0000';
+            this.ctx.globalAlpha = pulse;
+            this.ctx.fillStyle = '#FF4444';
+            this.ctx.beginPath();
+            this.ctx.arc(0, 0, fruit.radius + 5, 0, Math.PI * 2);
+            this.ctx.fill();
+            this.ctx.globalAlpha = 1;
+            this.ctx.shadowBlur = 0;
+        } else if (fruit.type === 'rainbow') {
+            // Rainbow shimmer effect
+            const time = Date.now() * 0.01;
+            const colors = ['#FF0080', '#FF4000', '#FF8000', '#FFFF00', '#80FF00', '#00FF80', '#0080FF', '#4000FF'];
+            const colorIndex = Math.floor(time) % colors.length;
+            this.ctx.fillStyle = colors[colorIndex];
+            this.ctx.globalAlpha = 0.6;
+            this.ctx.beginPath();
+            this.ctx.arc(0, 0, fruit.radius - 3, 0, Math.PI * 2);
+            this.ctx.fill();
+            this.ctx.globalAlpha = 1;
+        } else if (fruit.type === 'chaos') {
+            // Chaotic sparks
+            this.ctx.strokeStyle = '#8000FF';
+            this.ctx.lineWidth = 2;
+            for (let i = 0; i < 6; i++) {
+                const angle = (i / 6) * Math.PI * 2 + Date.now() * 0.01;
+                const sparkLength = 10 + Math.sin(Date.now() * 0.02 + i) * 5;
+                this.ctx.beginPath();
+                this.ctx.moveTo(0, 0);
+                this.ctx.lineTo(Math.cos(angle) * sparkLength, Math.sin(angle) * sparkLength);
+                this.ctx.stroke();
+            }
+        }
+        
         // Draw fruit shine
         this.ctx.fillStyle = 'rgba(255, 255, 255, 0.3)';
         this.ctx.beginPath();
@@ -946,6 +1026,39 @@ class FlappySlice {
         this.ctx.fill();
         
         this.ctx.restore();
+    }
+    
+    drawSpecialFruitEffects(fruit) {
+        // Add particle trails for special fruits
+        if (Math.random() < 0.3) {
+            this.particles.push({
+                x: fruit.x + (Math.random() - 0.5) * fruit.radius,
+                y: fruit.y + (Math.random() - 0.5) * fruit.radius,
+                velocityX: (Math.random() - 0.5) * 2,
+                velocityY: (Math.random() - 0.5) * 2,
+                color: fruit.color,
+                life: 30,
+                maxLife: 30,
+                size: Math.random() * 3 + 1
+            });
+        }
+    }
+    
+    createParticleExplosion(x, y, color, count = 10) {
+        for (let i = 0; i < count; i++) {
+            const angle = (i / count) * Math.PI * 2;
+            const speed = Math.random() * 4 + 2;
+            this.particles.push({
+                x: x,
+                y: y,
+                velocityX: Math.cos(angle) * speed,
+                velocityY: Math.sin(angle) * speed,
+                color: color,
+                life: 60,
+                maxLife: 60,
+                size: Math.random() * 4 + 2
+            });
+        }
     }
     
     drawParticle(particle) {
@@ -1009,6 +1122,10 @@ class FlappySlice {
         document.getElementById('level').textContent = this.level;
         document.getElementById('streak').textContent = this.currentStreak;
         document.getElementById('difficulty').textContent = this.getDifficultyDescription();
+        // Sync UI when in multiplayer with shared config
+        if (this.sharedConfig) {
+            document.getElementById('difficulty').textContent = 'Synced';
+        }
         document.getElementById('sliceMode').style.display = this.sliceMode ? 'block' : 'none';
         
         // Update active power-ups display
