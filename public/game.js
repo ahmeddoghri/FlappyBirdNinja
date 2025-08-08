@@ -24,12 +24,14 @@ class FlappySlice {
         
         // Game objects
         this.fruits = [];
+        this.fruitHalves = [];
         this.walls = [];
         this.particles = [];
         this.players = {};
         this.sliceEffects = [];
         this.deathEffects = [];
         this.powerUps = [];
+        this.floatingTexts = [];
         
         // Power-up system
         this.activePowerUps = new Map();
@@ -413,8 +415,11 @@ class FlappySlice {
         
         fruit.sliced = true;
         
-        // Create slice particles
-        this.createParticles(fruit.x, fruit.y, fruit.color, 8);
+        // Create dramatic slice effect
+        this.createSliceExplosion(fruit);
+        
+        // Create two fruit halves that fall with gravity
+        this.createFruitHalves(fruit);
         
         // Send slice to server for multiplayer
         if (this.isMultiplayer) {
@@ -428,11 +433,18 @@ class FlappySlice {
                 }
             });
         } else {
-            // Single player scoring
-            let points = fruit.type === 'bonus' ? 50 : 10;
+            // Enhanced single player scoring
+            let basePoints = fruit.type === 'bonus' ? 50 : 10;
+            let points = basePoints;
+            
+            // Combo multiplier
             if (this.combo > 0) {
                 points += this.combo * 2;
             }
+            
+            // Perfect slice bonus (extra points for clean slicing)
+            const sliceBonus = Math.floor(basePoints * 0.5);
+            points += sliceBonus;
             
             // Apply power-up effects
             if (this.hasDoublePoints) {
@@ -446,6 +458,9 @@ class FlappySlice {
             }
             
             this.score += points;
+            
+            // Show floating score text
+            this.showFloatingScore(fruit.x, fruit.y, points);
             this.combo++;
             this.fruitsSliced = (this.fruitsSliced || 0) + 1;
             
@@ -501,6 +516,87 @@ class FlappySlice {
                 maxLife: 60
             });
         }
+    }
+    
+    createSliceExplosion(fruit) {
+        // Create dramatic slice burst effect
+        for (let i = 0; i < 20; i++) {
+            this.particles.push({
+                x: fruit.x,
+                y: fruit.y,
+                vx: (Math.random() - 0.5) * 15,
+                vy: (Math.random() - 0.5) * 15,
+                color: fruit.color,
+                life: 40,
+                maxLife: 40,
+                size: Math.random() * 4 + 2
+            });
+        }
+        
+        // Add white flash particles
+        for (let i = 0; i < 10; i++) {
+            this.particles.push({
+                x: fruit.x,
+                y: fruit.y,
+                vx: (Math.random() - 0.5) * 12,
+                vy: (Math.random() - 0.5) * 12,
+                color: '#FFFFFF',
+                life: 25,
+                maxLife: 25,
+                size: Math.random() * 3 + 1
+            });
+        }
+    }
+    
+    createFruitHalves(fruit) {
+        // Create two halves that fall with gravity
+        const leftHalf = {
+            x: fruit.x - fruit.radius * 0.3,
+            y: fruit.y,
+            velocityX: -3 - Math.random() * 2,
+            velocityY: -2 - Math.random() * 3,
+            angularVelocity: -0.1 - Math.random() * 0.1,
+            rotation: 0,
+            radius: fruit.radius * 0.8,
+            color: fruit.color,
+            life: 180,
+            maxLife: 180,
+            gravity: 0.15,
+            bounce: 0.6,
+            type: 'left'
+        };
+        
+        const rightHalf = {
+            x: fruit.x + fruit.radius * 0.3,
+            y: fruit.y,
+            velocityX: 3 + Math.random() * 2,
+            velocityY: -2 - Math.random() * 3,
+            angularVelocity: 0.1 + Math.random() * 0.1,
+            rotation: 0,
+            radius: fruit.radius * 0.8,
+            color: fruit.color,
+            life: 180,
+            maxLife: 180,
+            gravity: 0.15,
+            bounce: 0.6,
+            type: 'right'
+        };
+        
+        this.fruitHalves.push(leftHalf, rightHalf);
+    }
+    
+    showFloatingScore(x, y, points) {
+        this.floatingTexts.push({
+            x: x,
+            y: y,
+            text: `+${points}`,
+            color: points > 20 ? '#FFD700' : '#00FF00',
+            size: points > 20 ? 24 : 18,
+            life: 60,
+            maxLife: 60,
+            velocityY: -2,
+            velocityX: (Math.random() - 0.5) * 2
+        });
     }
     
     showCombo() {
@@ -673,6 +769,11 @@ class FlappySlice {
         if (!this.isMultiplayer) {
             // Update fruits
             this.fruits.forEach((fruit, index) => {
+                // Skip sliced fruits - they should only show visual effects
+                if (fruit.sliced) {
+                    return;
+                }
+                
                 const oldX = fruit.x;
                 const oldY = fruit.y;
                 
@@ -751,6 +852,54 @@ class FlappySlice {
                         this.missedFruits = (this.missedFruits || 0) + 1;
                     }
                 }
+            });
+            
+            // Remove sliced fruits from the array (they're now shown as halves)
+            this.fruits = this.fruits.filter(fruit => !fruit.sliced);
+            
+            // Update fruit halves
+            this.fruitHalves = this.fruitHalves.filter(half => {
+                // Apply gravity
+                half.velocityY += half.gravity;
+                
+                // Update position
+                half.x += half.velocityX;
+                half.y += half.velocityY;
+                half.rotation += half.angularVelocity;
+                
+                // Bounce off ground
+                if (half.y + half.radius > this.canvas.height) {
+                    half.y = this.canvas.height - half.radius;
+                    half.velocityY = -Math.abs(half.velocityY) * half.bounce;
+                    half.velocityX *= 0.9; // Friction
+                    
+                    // Create bounce particles
+                    this.createParticles(half.x, half.y, half.color, 3);
+                    
+                    // Reduce bounce over time
+                    half.bounce *= 0.95;
+                }
+                
+                // Bounce off walls
+                if (half.x - half.radius < 0 || half.x + half.radius > this.canvas.width) {
+                    half.velocityX = -half.velocityX * half.bounce;
+                    half.x = half.x < this.canvas.width/2 ? half.radius : this.canvas.width - half.radius;
+                }
+                
+                // Fade over time
+                half.life--;
+                
+                // Remove when life is exhausted or off screen
+                return half.life > 0 && half.y < this.canvas.height + 100;
+            });
+            
+            // Update floating texts
+            this.floatingTexts = this.floatingTexts.filter(text => {
+                text.x += text.velocityX;
+                text.y += text.velocityY;
+                text.velocityY += 0.1; // Gravity
+                text.life--;
+                return text.life > 0;
             });
             
             // Update walls
@@ -894,6 +1043,11 @@ class FlappySlice {
                 this.drawFruit(fruit);
             });
             
+            // Draw fruit halves
+            this.fruitHalves.forEach(half => {
+                this.drawFruitHalf(half);
+            });
+            
             // Draw power-ups
             this.powerUps.forEach(powerUp => {
                 this.drawPowerUp(powerUp);
@@ -902,6 +1056,11 @@ class FlappySlice {
             // Draw particles
             this.particles.forEach(particle => {
                 this.drawParticle(particle);
+            });
+            
+            // Draw floating score texts
+            this.floatingTexts.forEach(text => {
+                this.drawFloatingText(text);
             });
             
             // Draw death effects
@@ -1024,6 +1183,91 @@ class FlappySlice {
         this.ctx.beginPath();
         this.ctx.arc(-fruit.radius/3, -fruit.radius/3, fruit.radius/3, 0, Math.PI * 2);
         this.ctx.fill();
+        
+        this.ctx.restore();
+    }
+    
+    drawFruitHalf(half) {
+        this.ctx.save();
+        this.ctx.translate(half.x, half.y);
+        this.ctx.rotate(half.rotation);
+        
+        // Calculate alpha based on life remaining
+        const alpha = Math.max(0.3, half.life / half.maxLife);
+        this.ctx.globalAlpha = alpha;
+        
+        // Draw half of the fruit with more realistic shape
+        this.ctx.fillStyle = half.color;
+        this.ctx.beginPath();
+        
+        if (half.type === 'left') {
+            // Draw left half - semicircle on the left
+            this.ctx.arc(0, 0, half.radius, Math.PI/2, -Math.PI/2, false);
+            this.ctx.lineTo(0, -half.radius);
+            this.ctx.lineTo(0, half.radius);
+        } else {
+            // Draw right half - semicircle on the right  
+            this.ctx.arc(0, 0, half.radius, -Math.PI/2, Math.PI/2, false);
+            this.ctx.lineTo(0, half.radius);
+            this.ctx.lineTo(0, -half.radius);
+        }
+        
+        this.ctx.closePath();
+        this.ctx.fill();
+        
+        // Add darker inner edge to show the cut
+        this.ctx.fillStyle = 'rgba(100, 50, 50, 0.8)';
+        this.ctx.fillRect(-2, -half.radius, 4, half.radius * 2);
+        
+        // Add cut line highlight
+        this.ctx.strokeStyle = 'rgba(255, 255, 255, 0.9)';
+        this.ctx.lineWidth = 2;
+        this.ctx.beginPath();
+        this.ctx.moveTo(0, -half.radius);
+        this.ctx.lineTo(0, half.radius);
+        this.ctx.stroke();
+        
+        // Add glossy highlight on the round edge
+        this.ctx.fillStyle = 'rgba(255, 255, 255, 0.4)';
+        this.ctx.beginPath();
+        if (half.type === 'left') {
+            this.ctx.arc(0, 0, half.radius * 0.7, Math.PI * 0.7, Math.PI * 0.3, false);
+            this.ctx.arc(0, 0, half.radius * 0.4, Math.PI * 0.3, Math.PI * 0.7, true);
+        } else {
+            this.ctx.arc(0, 0, half.radius * 0.7, Math.PI * 1.7, Math.PI * 1.3, false);
+            this.ctx.arc(0, 0, half.radius * 0.4, Math.PI * 1.3, Math.PI * 1.7, true);
+        }
+        this.ctx.closePath();
+        this.ctx.fill();
+        
+        // Occasional juice particle for extra realism
+        if (Math.random() < 0.05) {
+            this.createParticles(half.x, half.y, 'rgba(255, 100, 100, 0.8)', 1);
+        }
+        
+        this.ctx.restore();
+    }
+    
+    drawFloatingText(text) {
+        this.ctx.save();
+        const alpha = text.life / text.maxLife;
+        this.ctx.globalAlpha = alpha;
+        
+        // Add glow effect for high scores
+        if (text.color === '#FFD700') {
+            this.ctx.shadowBlur = 10;
+            this.ctx.shadowColor = text.color;
+        }
+        
+        this.ctx.fillStyle = text.color;
+        this.ctx.font = `bold ${text.size}px Arial`;
+        this.ctx.textAlign = 'center';
+        
+        // Add outline for better visibility
+        this.ctx.strokeStyle = '#000000';
+        this.ctx.lineWidth = 2;
+        this.ctx.strokeText(text.text, text.x, text.y);
+        this.ctx.fillText(text.text, text.x, text.y);
         
         this.ctx.restore();
     }
@@ -1215,10 +1459,12 @@ class FlappySlice {
         this.baseGameSpeed = 2;
         this.gameSpeed = this.baseGameSpeed;
         this.fruits = [];
+        this.fruitHalves = [];
         this.walls = [];
         this.particles = [];
         this.sliceEffects = [];
         this.deathEffects = [];
+        this.floatingTexts = [];
         this.lastFruitSpawn = 0;
         this.lastWallSpawn = 0;
         this.player.isAlive = true;
