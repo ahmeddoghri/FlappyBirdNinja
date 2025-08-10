@@ -308,17 +308,38 @@ class GameRoom {
                 }
             });
             
-            // Check wall collisions (death)
+            // Check wall collisions (death or shield)
             this.walls.forEach(wall => {
                 if (this.checkWallCollision(player.player, wall)) {
-                    player.isAlive = false;
-                    player.combo = 0;
-                    this.broadcastToRoom('playerDied', {
-                        playerId: playerId,
-                        cause: 'wall',
-                        x: player.player.x,
-                        y: player.player.y
-                    });
+                    if (player.player.hasShield) {
+                        // Shield protects player - break shield and allow passage
+                        player.player.hasShield = false;
+                        
+                        // Mark wall as broken by shield
+                        wall.brokenByShield = true;
+                        wall.breakTime = Date.now();
+                        
+                        // Broadcast shield break event
+                        this.broadcastToRoom('shieldBreak', {
+                            playerId: playerId,
+                            x: player.player.x,
+                            y: player.player.y,
+                            wallId: wall.id
+                        });
+                        
+                        // Push player slightly forward to ensure passage
+                        player.player.velocityY = -3;
+                        player.player.x += 5;
+                    } else {
+                        player.isAlive = false;
+                        player.combo = 0;
+                        this.broadcastToRoom('playerDied', {
+                            playerId: playerId,
+                            cause: 'wall',
+                            x: player.player.x,
+                            y: player.player.y
+                        });
+                    }
                 }
             });
         });
@@ -598,7 +619,12 @@ class GameRoom {
     }
     
     checkWallCollision(bird, wall) {
-        // Check if bird hits top or bottom wall
+        // Skip collision detection for walls broken by shield
+        if (wall.brokenByShield) {
+            return false;
+        }
+        
+        // Only check vertical wall collisions (left and right sides of pipes)
         const birdLeft = bird.x;
         const birdRight = bird.x + bird.width;
         const birdTop = bird.y;
@@ -607,16 +633,16 @@ class GameRoom {
         const wallLeft = wall.x;
         const wallRight = wall.x + wall.width;
         
-        // Check if bird is within wall's x range
-        if (birdRight > wallLeft && birdLeft < wallRight) {
-            // Check collision with top wall
-            if (birdTop < wall.topHeight) {
-                return true;
-            }
-            // Check collision with bottom wall
-            if (birdBottom > wall.bottomY) {
-                return true;
-            }
+        // Check if bird hits the left side of the wall
+        if (birdRight > wallLeft && birdLeft < wallLeft && 
+            ((birdTop < wall.topHeight) || (birdBottom > wall.bottomY))) {
+            return true;
+        }
+        
+        // Check if bird hits the right side of the wall
+        if (birdLeft < wallRight && birdRight > wallRight && 
+            ((birdTop < wall.topHeight) || (birdBottom > wall.bottomY))) {
+            return true;
         }
         
         return false;

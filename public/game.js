@@ -345,6 +345,30 @@ class FlappySlice {
             this.createDeathEffect(data.x, data.y, data.cause);
         });
         
+        this.socket.on('shieldBreak', (data) => {
+            // Handle shield break event
+            if (data.playerId === this.playerId) {
+                // Our shield broke
+                this.player.hasShield = false;
+                this.activePowerUps.delete('shield');
+            } else if (this.players[data.playerId]) {
+                // Another player's shield broke
+                this.players[data.playerId].hasShield = false;
+            }
+            
+            // Find the wall that was broken
+            const wall = this.walls.find(w => w.id === data.wallId);
+            if (wall) {
+                wall.brokenByShield = true;
+                wall.breakTime = Date.now();
+                this.createWallShatterEffect(wall);
+            }
+            
+            // Create shield break effect
+            this.createShieldBreakEffect(data.x, data.y);
+            this.playShieldBreakSound();
+        });
+        
         this.socket.on('fruitBounce', (data) => {
             // Create bounce particles when fruit hits wall
             const color = this.getWallParticleColor(data.wallType);
@@ -679,6 +703,11 @@ class FlappySlice {
     }
     
     checkWallCollision(bird, wall) {
+        // Skip collision detection for walls broken by shield
+        if (wall.brokenByShield) {
+            return false;
+        }
+        
         const birdLeft = bird.x;
         const birdRight = bird.x + bird.width;
         const birdTop = bird.y;
@@ -687,16 +716,17 @@ class FlappySlice {
         const wallLeft = wall.x;
         const wallRight = wall.x + wall.width;
         
-        // Check if bird is within wall's x range
-        if (birdRight > wallLeft && birdLeft < wallRight) {
-            // Check collision with top wall
-            if (birdTop < wall.topHeight) {
-                return true;
-            }
-            // Check collision with bottom wall
-            if (birdBottom > wall.bottomY) {
-                return true;
-            }
+        // Only check vertical wall collisions (left and right sides of pipes)
+        // Check if bird hits the left side of the wall
+        if (birdRight > wallLeft && birdLeft < wallLeft && 
+            ((birdTop < wall.topHeight) || (birdBottom > wall.bottomY))) {
+            return true;
+        }
+        
+        // Check if bird hits the right side of the wall
+        if (birdLeft < wallRight && birdRight > wallRight && 
+            ((birdTop < wall.topHeight) || (birdBottom > wall.bottomY))) {
+            return true;
         }
         
         return false;
@@ -888,15 +918,29 @@ class FlappySlice {
             });
             
             // Check wall collisions for player
-            this.walls.forEach(wall => {
+            this.walls.forEach((wall, wallIndex) => {
                 if (this.checkWallCollision(this.player, wall)) {
                     if (this.player.hasShield) {
-                        // Shield protects player
+                        // Shield protects player - break shield and allow passage
                         this.player.hasShield = false;
                         this.activePowerUps.delete('shield');
                         this.createShieldBreakEffect(this.player.x, this.player.y);
-                        // Push player away from wall
-                        this.player.velocityY = -5;
+                        
+                        // Mark wall as broken by shield
+                        wall.brokenByShield = true;
+                        wall.breakTime = Date.now();
+                        
+                        // Create shattering effect for the wall
+                        this.createWallShatterEffect(wall);
+                        
+                        // Push player slightly forward to ensure passage
+                        this.player.velocityY = -3;
+                        this.player.x += 5; // Small forward push
+                        
+                        // Play shield break sound
+                        this.playShieldBreakSound();
+                        this.vibrate([100, 50, 100]);
+                        this.addScreenShake(8, 20);
                     } else {
                         this.createDeathEffect(this.player.x, this.player.y, 'wall');
                         this.playDeathSound();
@@ -1713,6 +1757,12 @@ class FlappySlice {
     }
     
     drawWall(wall) {
+        // If wall is broken by shield, draw it with shattered appearance
+        if (wall.brokenByShield) {
+            this.drawShatteredWall(wall);
+            return;
+        }
+        
         const wallType = wall.type || 'crystal';
         
         switch(wallType) {
@@ -1906,6 +1956,70 @@ class FlappySlice {
         return result ? 
             `${parseInt(result[1], 16)}, ${parseInt(result[2], 16)}, ${parseInt(result[3], 16)}` :
             '255, 255, 255';
+    }
+    
+    drawShatteredWall(wall) {
+        // Draw broken/shattered wall pieces with fade effect
+        const timeSinceBroken = Date.now() - wall.breakTime;
+        const fadeProgress = Math.min(timeSinceBroken / 2000, 1); // 2 seconds fade
+        const alpha = 1 - fadeProgress * 0.7; // fade to 30% opacity
+        
+        this.ctx.save();
+        this.ctx.globalAlpha = alpha;
+        
+        // Get base color for wall type
+        const baseColor = this.getWallParticleColor(wall.type);
+        this.ctx.fillStyle = `rgba(${this.hexToRgb(baseColor)}, ${alpha * 0.3})`;
+        this.ctx.strokeStyle = `rgba(${this.hexToRgb(baseColor)}, ${alpha * 0.8})`;
+        this.ctx.lineWidth = 1;
+        
+        // Draw fragmented pieces for top wall
+        if (wall.topHeight > 0) {
+            this.drawShatteredPieces(wall.x, 0, wall.width, wall.topHeight, timeSinceBroken);
+        }
+        
+        // Draw fragmented pieces for bottom wall  
+        if (wall.bottomHeight > 0) {
+            this.drawShatteredPieces(wall.x, wall.bottomY, wall.width, wall.bottomHeight, timeSinceBroken);
+        }
+        
+        // Draw gap indicator faintly
+        this.ctx.globalAlpha = alpha * 0.5;
+        this.drawGapIndicator(wall, baseColor);
+        
+        this.ctx.restore();
+    }
+    
+    drawShatteredPieces(x, y, width, height, timeSinceBroken) {
+        // Draw irregular broken pieces
+        const numPieces = 8;
+        const animationOffset = Math.min(timeSinceBroken / 100, 20); // pieces slowly drift apart
+        
+        for (let i = 0; i < numPieces; i++) {
+            this.ctx.save();
+            
+            const pieceX = x + (width / numPieces) * i + (Math.random() - 0.5) * animationOffset;
+            const pieceY = y + (height / numPieces) * (i % 3) + (Math.random() - 0.5) * animationOffset;
+            const pieceWidth = width / numPieces + Math.random() * 5;
+            const pieceHeight = height / (numPieces / 3) + Math.random() * 5;
+            
+            // Slight rotation for each piece
+            this.ctx.translate(pieceX + pieceWidth/2, pieceY + pieceHeight/2);
+            this.ctx.rotate((Math.random() - 0.5) * 0.3 * (timeSinceBroken / 1000));
+            
+            // Draw irregular shape
+            this.ctx.beginPath();
+            this.ctx.moveTo(-pieceWidth/2, -pieceHeight/2);
+            this.ctx.lineTo(pieceWidth/2 + (Math.random() - 0.5) * 3, -pieceHeight/2);
+            this.ctx.lineTo(pieceWidth/2, pieceHeight/2 + (Math.random() - 0.5) * 3);
+            this.ctx.lineTo(-pieceWidth/2 + (Math.random() - 0.5) * 3, pieceHeight/2);
+            this.ctx.closePath();
+            
+            this.ctx.fill();
+            this.ctx.stroke();
+            
+            this.ctx.restore();
+        }
     }
     
     createDeathEffect(x, y, cause) {
@@ -2619,6 +2733,45 @@ class FlappySlice {
     
     playWallBounceSound() {
         this.playSound(300, 0.08, 0.1, 'square');
+    }
+    
+    playShieldBreakSound() {
+        // Shield break sound - glass breaking effect
+        this.playSound(800, 0.15, 0.1, 'triangle');
+        setTimeout(() => this.playSound(600, 0.12, 0.08, 'triangle'), 30);
+        setTimeout(() => this.playSound(400, 0.10, 0.06, 'triangle'), 60);
+        setTimeout(() => this.playSound(200, 0.08, 0.04, 'triangle'), 90);
+    }
+    
+    createWallShatterEffect(wall) {
+        // Create multiple particle bursts to simulate wall shattering
+        const centerX = wall.x + wall.width / 2;
+        
+        // Shatter particles for top wall part
+        if (wall.topHeight > 0) {
+            const topCenterY = wall.topHeight / 2;
+            this.createParticles(centerX, topCenterY, this.getWallParticleColor(wall.type), 20);
+            this.createParticles(wall.x, topCenterY, this.getWallParticleColor(wall.type), 15);
+            this.createParticles(wall.x + wall.width, topCenterY, this.getWallParticleColor(wall.type), 15);
+        }
+        
+        // Shatter particles for bottom wall part  
+        if (wall.bottomHeight > 0) {
+            const bottomCenterY = wall.bottomY + wall.bottomHeight / 2;
+            this.createParticles(centerX, bottomCenterY, this.getWallParticleColor(wall.type), 20);
+            this.createParticles(wall.x, bottomCenterY, this.getWallParticleColor(wall.type), 15);
+            this.createParticles(wall.x + wall.width, bottomCenterY, this.getWallParticleColor(wall.type), 15);
+        }
+        
+        // Add some special sparkle effects
+        setTimeout(() => {
+            if (wall.topHeight > 0) {
+                this.createParticles(centerX, wall.topHeight / 2, '#FFD700', 10);
+            }
+            if (wall.bottomHeight > 0) {
+                this.createParticles(centerX, wall.bottomY + wall.bottomHeight / 2, '#FFD700', 10);
+            }
+        }, 100);
     }
     
     createAudioToggle() {
