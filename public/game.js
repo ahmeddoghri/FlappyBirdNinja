@@ -380,6 +380,11 @@ class FlappySlice {
             this.createParticles(data.x, data.y, '#FFD700', 6);
         });
         
+        this.socket.on('ballCollision', (data) => {
+            // Create particles when balls collide with each other
+            this.createParticles(data.x, data.y, '#FFD700', 8);
+        });
+        
         this.socket.on('playerReadyUpdate', (data) => {
             // Update ready state display
             this.updateReadyState(data);
@@ -656,17 +661,25 @@ class FlappySlice {
             const types = ['apple', 'orange', 'banana', 'bonus'];
             const type = types[Math.floor(Math.random() * types.length)];
             
+            // Create more varied initial velocities for multi-directional movement
+            const angle = Math.random() * Math.PI * 2; // Random angle 0-360 degrees
+            const speed = 2 + Math.random() * 3; // Speed between 2-5
+            const initialVelX = Math.cos(angle) * speed;
+            const initialVelY = Math.sin(angle) * speed;
+            
             this.fruits.push({
                 id: `fruit_${Date.now()}_${Math.random()}`,
                 x: this.canvas.width + 50,
                 y: Math.random() * (this.canvas.height - 100) + 50,
                 radius: type === 'bonus' ? 25 : 20,
-                velocityX: -this.gameSpeed,
-                velocityY: (Math.random() - 0.5) * 2,
+                velocityX: initialVelX - this.gameSpeed, // Combine random motion with screen movement
+                velocityY: initialVelY,
                 color: this.getFruitColor(type),
                 type: type,
                 sliced: false,
-                rotation: 0
+                rotation: 0,
+                hasGravity: Math.random() < 0.3, // Only 30% of balls have gravity
+                spawnTime: now // Track when the ball was created
             });
             
             this.lastFruitSpawn = now;
@@ -756,6 +769,199 @@ class FlappySlice {
         return false;
     }
     
+    checkFruitWallCollisionDetailed(fruit, wall) {
+        const fruitLeft = fruit.x - fruit.radius;
+        const fruitRight = fruit.x + fruit.radius;
+        const fruitTop = fruit.y - fruit.radius;
+        const fruitBottom = fruit.y + fruit.radius;
+        
+        const wallLeft = wall.x;
+        const wallRight = wall.x + wall.width;
+        
+        let hasCollision = false;
+        let collisionSide = null;
+        let penetrationDepth = 0;
+        let normal = { x: 0, y: 0 };
+        
+        // Check if fruit is within wall's x range
+        if (fruitRight > wallLeft && fruitLeft < wallRight) {
+            // Check collision with top wall part
+            if (fruitTop < wall.topHeight) {
+                hasCollision = true;
+                collisionSide = 'top';
+                penetrationDepth = wall.topHeight - fruitTop;
+                normal = { x: 0, y: -1 }; // Normal points downward from top wall
+            }
+            // Check collision with bottom wall part
+            else if (fruitBottom > wall.bottomY) {
+                hasCollision = true;
+                collisionSide = 'bottom';
+                penetrationDepth = fruitBottom - wall.bottomY;
+                normal = { x: 0, y: 1 }; // Normal points upward from bottom wall
+            }
+        }
+        
+        // Check side collisions (left and right sides of wall)
+        if (!hasCollision) {
+            const fruitCenterY = fruit.y;
+            // Only check side collisions if fruit is in the gap area
+            if (fruitCenterY > wall.topHeight && fruitCenterY < wall.bottomY) {
+                // Check left side collision
+                if (fruitRight > wallLeft && fruit.x < wallLeft) {
+                    hasCollision = true;
+                    collisionSide = 'left';
+                    penetrationDepth = fruitRight - wallLeft;
+                    normal = { x: -1, y: 0 }; // Normal points left from wall
+                }
+                // Check right side collision
+                else if (fruitLeft < wallRight && fruit.x > wallRight) {
+                    hasCollision = true;
+                    collisionSide = 'right';
+                    penetrationDepth = wallRight - fruitLeft;
+                    normal = { x: 1, y: 0 }; // Normal points right from wall
+                }
+            }
+        }
+        
+        return {
+            hasCollision,
+            side: collisionSide,
+            penetrationDepth,
+            normal
+        };
+    }
+    
+    separateFruitFromWall(fruit, wall, collision) {
+        // Move fruit out of wall by penetration depth plus a small buffer
+        const buffer = 2; // Extra separation to prevent immediate re-collision
+        const separation = collision.penetrationDepth + buffer;
+        
+        fruit.x -= collision.normal.x * separation;
+        fruit.y -= collision.normal.y * separation;
+    }
+    
+    calculateFruitReflection(fruit, collision) {
+        // Calculate reflection using collision normal
+        const normal = collision.normal;
+        
+        // Calculate dot product of velocity and normal
+        const dotProduct = fruit.velocityX * normal.x + fruit.velocityY * normal.y;
+        
+        // Reflect velocity vector
+        const reflectedX = fruit.velocityX - 2 * dotProduct * normal.x;
+        const reflectedY = fruit.velocityY - 2 * dotProduct * normal.y;
+        
+        // Add some randomness to prevent predictable bouncing
+        const randomFactor = 0.3;
+        const randomX = (Math.random() - 0.5) * randomFactor;
+        const randomY = (Math.random() - 0.5) * randomFactor;
+        
+        return {
+            velocityX: reflectedX + randomX,
+            velocityY: reflectedY + randomY
+        };
+    }
+    
+    checkBallToBallCollision(ball1, ball2) {
+        const dx = ball2.x - ball1.x;
+        const dy = ball2.y - ball1.y;
+        const distance = Math.sqrt(dx * dx + dy * dy);
+        const minDistance = ball1.radius + ball2.radius;
+        
+        if (distance < minDistance) {
+            const penetration = minDistance - distance;
+            const normal = distance > 0 ? { x: dx / distance, y: dy / distance } : { x: 1, y: 0 };
+            
+            return {
+                hasCollision: true,
+                penetration,
+                normal,
+                distance
+            };
+        }
+        
+        return { hasCollision: false };
+    }
+    
+    handleBallToBallCollision(ball1, ball2, collision) {
+        // Separate balls to prevent overlap
+        const separationDistance = collision.penetration / 2 + 1; // Extra buffer
+        
+        ball1.x -= collision.normal.x * separationDistance;
+        ball1.y -= collision.normal.y * separationDistance;
+        ball2.x += collision.normal.x * separationDistance;
+        ball2.y += collision.normal.y * separationDistance;
+        
+        // Calculate relative velocity
+        const relativeVelX = ball2.velocityX - ball1.velocityX;
+        const relativeVelY = ball2.velocityY - ball1.velocityY;
+        
+        // Calculate relative velocity along collision normal
+        const velocityAlongNormal = relativeVelX * collision.normal.x + relativeVelY * collision.normal.y;
+        
+        // Don't resolve if velocities are separating
+        if (velocityAlongNormal > 0) return;
+        
+        // Calculate restitution (bounciness) - increased for more energetic bounces
+        const restitution = 0.85;
+        
+        // Calculate impulse scalar
+        const impulseScalar = -(1 + restitution) * velocityAlongNormal;
+        
+        // Mass proportional to area
+        const mass1 = ball1.radius * ball1.radius;
+        const mass2 = ball2.radius * ball2.radius;
+        const totalMass = mass1 + mass2;
+        
+        // Apply impulse
+        const impulse1 = impulseScalar * mass2 / totalMass;
+        const impulse2 = impulseScalar * mass1 / totalMass;
+        
+        ball1.velocityX -= impulse1 * collision.normal.x;
+        ball1.velocityY -= impulse1 * collision.normal.y;
+        ball2.velocityX += impulse2 * collision.normal.x;
+        ball2.velocityY += impulse2 * collision.normal.y;
+        
+        // Add perpendicular velocity component for more varied bouncing
+        const perpX = -collision.normal.y; // Perpendicular to collision normal
+        const perpY = collision.normal.x;
+        const perpImpulse = (Math.random() - 0.5) * 2; // Random perpendicular force
+        
+        ball1.velocityX += perpX * perpImpulse;
+        ball1.velocityY += perpY * perpImpulse;
+        ball2.velocityX -= perpX * perpImpulse;
+        ball2.velocityY -= perpY * perpImpulse;
+        
+        // Reduced damping to maintain energy longer
+        const damping = 0.98;
+        ball1.velocityX *= damping;
+        ball1.velocityY *= damping;
+        ball2.velocityX *= damping;
+        ball2.velocityY *= damping;
+        
+        // Ensure minimum velocity to keep balls moving
+        const minSpeed = 1.0;
+        const speed1 = Math.sqrt(ball1.velocityX * ball1.velocityX + ball1.velocityY * ball1.velocityY);
+        const speed2 = Math.sqrt(ball2.velocityX * ball2.velocityX + ball2.velocityY * ball2.velocityY);
+        
+        if (speed1 < minSpeed && speed1 > 0) {
+            ball1.velocityX = (ball1.velocityX / speed1) * minSpeed;
+            ball1.velocityY = (ball1.velocityY / speed1) * minSpeed;
+        }
+        if (speed2 < minSpeed && speed2 > 0) {
+            ball2.velocityX = (ball2.velocityX / speed2) * minSpeed;
+            ball2.velocityY = (ball2.velocityY / speed2) * minSpeed;
+        }
+        
+        // Create collision particles
+        const collisionX = ball1.x + collision.normal.x * ball1.radius;
+        const collisionY = ball1.y + collision.normal.y * ball1.radius;
+        this.createParticles(collisionX, collisionY, '#FFD700', 5);
+        
+        // Play collision sound (if you have one)
+        // this.playBallCollisionSound();
+    }
+    
     getFruitColor(type) {
         const colors = {
             apple: '#FF4444',
@@ -828,30 +1034,40 @@ class FlappySlice {
                 fruit.y += fruit.velocityY;
                 fruit.rotation += fruit.rotationSpeed || 0.1;
                 
-                // Apply gravity to fruits
-                fruit.velocityY += 0.2;
+                // Apply gravity only to some fruits for more varied movement
+                if (fruit.hasGravity) {
+                    fruit.velocityY += 0.15; // Reduced gravity
+                } else {
+                    // Add slight random velocity changes for more dynamic movement
+                    fruit.velocityX += (Math.random() - 0.5) * 0.1;
+                    fruit.velocityY += (Math.random() - 0.5) * 0.1;
+                }
                 
-                // Check collision with walls - enhanced physics
+                // Check collision with walls - enhanced physics with proper separation
                 this.walls.forEach(wall => {
-                    if (this.checkFruitWallCollision(fruit, wall)) {
-                        const collisionAngle = this.calculateCollisionAngle(fruit, wall, oldX, oldY);
+                    const collision = this.checkFruitWallCollisionDetailed(fruit, wall);
+                    if (collision.hasCollision) {
+                        // Ensure proper separation from wall to prevent sticking
+                        this.separateFruitFromWall(fruit, wall, collision);
                         
-                        if (Math.abs(collisionAngle) < Math.PI/4 || Math.abs(collisionAngle) > 3*Math.PI/4) {
-                            // Horizontal collision with angle variation
-                            fruit.velocityX = -fruit.velocityX * 0.8;
-                            fruit.velocityY += (Math.random() - 0.5) * 2;
-                            fruit.x = oldX;
-                        } else {
-                            // Vertical collision with angle variation
-                            fruit.velocityY = -fruit.velocityY * 0.8;
-                            fruit.velocityX += (Math.random() - 0.5) * 1;
-                            fruit.y = oldY;
+                        // Calculate reflection based on collision normal
+                        const reflectionData = this.calculateFruitReflection(fruit, collision);
+                        
+                        // Apply reflection with energy loss
+                        fruit.velocityX = reflectionData.velocityX * 0.85;
+                        fruit.velocityY = reflectionData.velocityY * 0.85;
+                        
+                        // Ensure minimum velocity to prevent getting stuck
+                        const minVel = 1.5;
+                        if (Math.abs(fruit.velocityX) < minVel && Math.abs(fruit.velocityY) < minVel) {
+                            fruit.velocityX = fruit.velocityX >= 0 ? minVel : -minVel;
+                            fruit.velocityY = fruit.velocityY >= 0 ? minVel : -minVel;
                         }
                         
-                        // Add rotational spin
+                        // Add rotational spin based on impact
                         fruit.rotationSpeed = (Math.random() - 0.5) * 0.4;
                         
-                        // Create particles based on wall type
+                        // Create particles and sound
                         const particleColor = this.getWallParticleColor(wall.type);
                         this.createParticles(fruit.x, fruit.y, particleColor, 8);
                         this.playWallBounceSound();
@@ -880,18 +1096,45 @@ class FlappySlice {
                     }
                 }
                 
-                // Bounce off screen boundaries
-                if (fruit.y - fruit.radius < 0) {
-                    fruit.y = fruit.radius;
-                    fruit.velocityY = Math.abs(fruit.velocityY) * 0.8;
-                }
-                if (fruit.y + fruit.radius > this.canvas.height) {
-                    fruit.y = this.canvas.height - fruit.radius;
-                    fruit.velocityY = -Math.abs(fruit.velocityY) * 0.8;
+                // Check ball-to-ball collisions to prevent overlap
+                for (let j = index + 1; j < this.fruits.length; j++) {
+                    const otherFruit = this.fruits[j];
+                    if (otherFruit.sliced) continue;
+                    
+                    const collision = this.checkBallToBallCollision(fruit, otherFruit);
+                    if (collision.hasCollision) {
+                        this.handleBallToBallCollision(fruit, otherFruit, collision);
+                    }
                 }
                 
-                // Remove fruits that are off screen
-                if (fruit.x < -fruit.radius * 2) {
+                // Bounce off screen boundaries with more energy
+                if (fruit.y - fruit.radius < 0) {
+                    fruit.y = fruit.radius + 2; // Add buffer to prevent sticking
+                    fruit.velocityY = Math.abs(fruit.velocityY) * 0.9;
+                    fruit.velocityX += (Math.random() - 0.5) * 2; // Add horizontal randomness
+                }
+                if (fruit.y + fruit.radius > this.canvas.height) {
+                    fruit.y = this.canvas.height - fruit.radius - 2; // Add buffer
+                    fruit.velocityY = -Math.abs(fruit.velocityY) * 0.9;
+                    fruit.velocityX += (Math.random() - 0.5) * 2; // Add horizontal randomness
+                }
+                
+                // Bounce off left and right screen boundaries (instead of removing)
+                if (fruit.x - fruit.radius < 0) {
+                    fruit.x = fruit.radius + 2;
+                    fruit.velocityX = Math.abs(fruit.velocityX) * 0.9;
+                    fruit.velocityY += (Math.random() - 0.5) * 2; // Add vertical randomness
+                }
+                if (fruit.x + fruit.radius > this.canvas.width) {
+                    fruit.x = this.canvas.width - fruit.radius - 2;
+                    fruit.velocityX = -Math.abs(fruit.velocityX) * 0.9;
+                    fruit.velocityY += (Math.random() - 0.5) * 2; // Add vertical randomness
+                }
+                
+                // Only remove fruits after they've been on screen for a while and are moving away
+                // This prevents immediate removal of bouncing balls
+                const fruitAge = Date.now() - (fruit.spawnTime || Date.now());
+                if (fruit.x < -fruit.radius * 2 && fruit.velocityX < 0 && fruitAge > 2000) {
                     this.fruits.splice(index, 1);
                     // Lose combo if fruit escapes
                     if (!fruit.sliced) {
