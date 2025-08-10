@@ -179,6 +179,16 @@ class GameRoom {
         
         // Update fruits
         this.fruits = this.fruits.filter(fruit => {
+            // Remove sliced fruits after they've been processed for a short time
+            if (fruit.sliced) {
+                fruit.sliceTimer = (fruit.sliceTimer || 0) + 1;
+                // Remove after 60 frames (~1 second at 60fps)
+                if (fruit.sliceTimer > 60) {
+                    return false;
+                }
+                return true; // Keep sliced fruits briefly for visual effects
+            }
+            
             // Store old position for collision detection
             const oldX = fruit.x;
             const oldY = fruit.y;

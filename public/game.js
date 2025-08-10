@@ -245,7 +245,14 @@ class FlappySlice {
         
         this.socket.on('gameUpdate', (data) => {
             if (this.gameState === 'playing') {
-                this.fruits = data.fruits || [];
+                // Filter out any fruits that have been sliced locally
+                const receivedFruits = data.fruits || [];
+                this.fruits = receivedFruits.filter(serverFruit => {
+                    // Keep fruits that haven't been sliced locally
+                    const localFruit = this.fruits.find(f => f.id === serverFruit.id);
+                    return !localFruit || !localFruit.sliced;
+                });
+                
                 this.walls = data.walls || [];
             }
         });
@@ -281,11 +288,14 @@ class FlappySlice {
                 fruit.sliced = true;
                 fruit.slicedBy = data.playerId;
                 
-                // Create slice effect
-                this.createSliceEffect(fruit, data.sliceData);
+                // Use the same enhanced effects as single player
+                this.createSliceExplosion(fruit);
+                this.createFruitHalves(fruit);
                 
-                // Create particles for visual feedback
-                this.createParticles(fruit.x, fruit.y, fruit.color, 8);
+                // Show floating score for the player who sliced
+                if (data.playerId === this.playerId) {
+                    this.showFloatingScore(fruit.x, fruit.y, data.points || 10);
+                }
                 
                 // Update player score if it's not us
                 if (data.playerId !== this.playerId && this.players[data.playerId]) {
@@ -302,13 +312,20 @@ class FlappySlice {
                     }
                 }
                 
-                // Remove the fruit after a short delay for visual effect
-                setTimeout(() => {
-                    const currentIndex = this.fruits.findIndex(f => f.id === data.fruitId);
-                    if (currentIndex !== -1) {
-                        this.fruits.splice(currentIndex, 1);
+                // Audio and haptic feedback for the slicer
+                if (data.playerId === this.playerId) {
+                    this.playSliceSound();
+                    this.vibrate([40]);
+                    
+                    // Visual effects based on combo
+                    if (this.combo > 5) {
+                        this.addScreenShake(3, 10);
+                        this.addZoomEffect(1.05, 15);
+                        this.createBackgroundEffect('burst', fruit.x, fruit.y, fruit.color);
                     }
-                }, 200);
+                }
+                
+                // Note: Fruits will be removed by the main update loop filter for sliced fruits
             }
         });
         
@@ -857,51 +874,6 @@ class FlappySlice {
             // Remove sliced fruits from the array (they're now shown as halves)
             this.fruits = this.fruits.filter(fruit => !fruit.sliced);
             
-            // Update fruit halves
-            this.fruitHalves = this.fruitHalves.filter(half => {
-                // Apply gravity
-                half.velocityY += half.gravity;
-                
-                // Update position
-                half.x += half.velocityX;
-                half.y += half.velocityY;
-                half.rotation += half.angularVelocity;
-                
-                // Bounce off ground
-                if (half.y + half.radius > this.canvas.height) {
-                    half.y = this.canvas.height - half.radius;
-                    half.velocityY = -Math.abs(half.velocityY) * half.bounce;
-                    half.velocityX *= 0.9; // Friction
-                    
-                    // Create bounce particles
-                    this.createParticles(half.x, half.y, half.color, 3);
-                    
-                    // Reduce bounce over time
-                    half.bounce *= 0.95;
-                }
-                
-                // Bounce off walls
-                if (half.x - half.radius < 0 || half.x + half.radius > this.canvas.width) {
-                    half.velocityX = -half.velocityX * half.bounce;
-                    half.x = half.x < this.canvas.width/2 ? half.radius : this.canvas.width - half.radius;
-                }
-                
-                // Fade over time
-                half.life--;
-                
-                // Remove when life is exhausted or off screen
-                return half.life > 0 && half.y < this.canvas.height + 100;
-            });
-            
-            // Update floating texts
-            this.floatingTexts = this.floatingTexts.filter(text => {
-                text.x += text.velocityX;
-                text.y += text.velocityY;
-                text.velocityY += 0.1; // Gravity
-                text.life--;
-                return text.life > 0;
-            });
-            
             // Update walls
             this.walls = this.walls.filter(wall => {
                 const oldX = wall.x;
@@ -941,6 +913,51 @@ class FlappySlice {
             this.spawnWall();
             this.spawnPowerUp();
         }
+        
+        // Update fruit halves (works in both single and multiplayer)
+        this.fruitHalves = this.fruitHalves.filter(half => {
+            // Apply gravity
+            half.velocityY += half.gravity;
+            
+            // Update position
+            half.x += half.velocityX;
+            half.y += half.velocityY;
+            half.rotation += half.angularVelocity;
+            
+            // Bounce off ground
+            if (half.y + half.radius > this.canvas.height) {
+                half.y = this.canvas.height - half.radius;
+                half.velocityY = -Math.abs(half.velocityY) * half.bounce;
+                half.velocityX *= 0.9; // Friction
+                
+                // Create bounce particles
+                this.createParticles(half.x, half.y, half.color, 3);
+                
+                // Reduce bounce over time
+                half.bounce *= 0.95;
+            }
+            
+            // Bounce off walls
+            if (half.x - half.radius < 0 || half.x + half.radius > this.canvas.width) {
+                half.velocityX = -half.velocityX * half.bounce;
+                half.x = half.x < this.canvas.width/2 ? half.radius : this.canvas.width - half.radius;
+            }
+            
+            // Fade over time
+            half.life--;
+            
+            // Remove when life is exhausted or off screen
+            return half.life > 0 && half.y < this.canvas.height + 100;
+        });
+        
+        // Update floating texts (works in both single and multiplayer)
+        this.floatingTexts = this.floatingTexts.filter(text => {
+            text.x += text.velocityX;
+            text.y += text.velocityY;
+            text.velocityY += 0.1; // Gravity
+            text.life--;
+            return text.life > 0;
+        });
         
         // Update particles
         this.particles.forEach((particle, index) => {
